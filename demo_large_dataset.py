@@ -172,8 +172,7 @@ def process_large_dataset_windowed(image_paths, window_size=70, overlap=20, devi
             
             # Handle alignment based on window
             if window_idx == 0:
-                previous_window_extrinsics = extrinsic_window
-                previous_window_end_idx = end_idx
+                transformed_extrinsics = extrinsic_window
             if window_idx > 0:
                 assert previous_window_extrinsics is not None
 
@@ -197,10 +196,8 @@ def process_large_dataset_windowed(image_paths, window_size=70, overlap=20, devi
                     )
 
                     transformed_extrinsics = np.concatenate([curr_overlap_extrinsics, transformed_nonoverlap_extrinsics], axis=0)
-                    previous_window_extrinsics = transformed_extrinsics
+
             
-            # Store results for each frame in the window
-            # FIXED: Don't use offset, just store all frames and let the overlap check handle duplicates
             for i in range(len(transformed_extrinsics)):
                 global_frame_idx = start_idx + i
                 
