@@ -59,6 +59,36 @@ def extrinsic_to_pose(extrinsic):
     return closed_form_inverse_se3(to_4x4(extrinsic)[None])[0]
 
 
+def transform_points_to_reference(points_window, T_align):
+    """
+    Transform 3D points to global reference system using T_align matrix
+    
+    Args:
+        points_window (np.ndarray): Points in window's local coordinates (S, H, W, 3)
+        T_align (np.ndarray): 4x4 alignment matrix
+        
+    Returns:
+        np.ndarray: Transformed points in global coordinates (S, H, W, 3)
+    """
+    transformed_points = np.zeros_like(points_window)
+    
+    for i in range(points_window.shape[0]):
+        frame_points = points_window[i]
+        H, W, _ = frame_points.shape
+        
+        # Convert to homogeneous coordinates
+        points_hom = np.ones((H * W, 4))
+        points_hom[:, :3] = frame_points.reshape(-1, 3)
+        
+        # Apply transformation
+        transformed_hom = (T_align @ points_hom.T).T
+        
+        # Convert back to 3D and reshape
+        transformed_points[i] = transformed_hom[:, :3].reshape(H, W, 3)
+    
+    return transformed_points
+
+
 def transform_poses_to_reference(extrinsics_window, reference_extrinsic):
     """
     Transform poses in a window to be relative to the reference coordinate system.
@@ -71,16 +101,17 @@ def transform_poses_to_reference(extrinsics_window, reference_extrinsic):
         np.ndarray: Transformed extrinsics relative to reference
     """
     ref_4x4 = to_4x4(reference_extrinsic)
-    # ref_inv = np.linalg.inv(ref_4x4)
+    T_curr_common = to_4x4(extrinsics_window[0])
+    T_align = ref_4x4 @ closed_form_inverse_se3(T_curr_common[None])[0]
+
     
     transformed_extrinsics = []
     for i in range(extrinsics_window.shape[0]):
         current_4x4 = to_4x4(extrinsics_window[i])
-        transformed_4x4 = current_4x4 @ ref_4x4
-        transformed_3x4 = to_3x4(transformed_4x4)
-        transformed_extrinsics.append(transformed_3x4)
+        transformed_4x4 = current_4x4 @ T_align
+        transformed_extrinsics.append(to_3x4(transformed_4x4))
     
-    return np.stack(transformed_extrinsics)
+    return np.stack(transformed_extrinsics), T_align
 
 
 def process_large_dataset_windowed(image_paths, window_size=70, overlap=20, device="cuda"):
@@ -115,10 +146,11 @@ def process_large_dataset_windowed(image_paths, window_size=70, overlap=20, devi
     stride = window_size - overlap
     window_starts = list(range(0, total_frames - window_size + 1, stride))
     
-    # Add final window if necessary to cover all frames
-    if window_starts[-1] + window_size < total_frames:
-        window_starts.append(total_frames - window_size)
-    
+    # Ensure last window doesn't exceed bounds
+    if window_starts[-1] + window_size > total_frames:
+        window_starts[-1] = total_frames - window_size
+        
+    print('window_starts', window_starts)
     print(f"Will process {len(window_starts)} windows")
     
     # Storage for unified results
@@ -131,13 +163,8 @@ def process_large_dataset_windowed(image_paths, window_size=70, overlap=20, devi
         'depth': {},
         'depth_conf': {}
     }
-    
-    # Global reference transformation (from first window, first frame)
-    global_reference_extrinsic = None
-    
-    # Store previous window results for overlap-based alignment
+
     previous_window_extrinsics = None
-    previous_window_end_idx = None
     
     # Process each window
     for window_idx, start_idx in enumerate(tqdm(window_starts, desc="Processing windows")):
@@ -146,86 +173,72 @@ def process_large_dataset_windowed(image_paths, window_size=70, overlap=20, devi
         
         print(f"\nWindow {window_idx + 1}/{len(window_starts)}: frames {start_idx}-{end_idx-1}")
         
-        try:
-            # Load and preprocess images for current window
-            images = load_and_preprocess_images(window_image_paths).to(device)
-            print(f"Loaded window images shape: {images.shape}")
-            
-            # Run VGGT inference
-            with torch.no_grad():
-                with torch.cuda.amp.autocast(dtype=dtype):
-                    predictions = model(images)
-            
-            # Convert pose encoding to matrices
-            extrinsic_window, intrinsic_window = pose_encoding_to_extri_intri(
-                predictions["pose_enc"], images.shape[-2:]
-            )
-            
-            # Convert to numpy and remove batch dimension
-            extrinsic_window = extrinsic_window.squeeze(0).cpu().numpy()  # (S, 3, 4)
-            intrinsic_window = intrinsic_window.squeeze(0).cpu().numpy()   # (S, 3, 3)
-            images_np = images.cpu().numpy()  # (S, 3, H, W)
-            world_points = predictions["world_points"].squeeze(0).cpu().numpy()  # (S, H, W, 3)
-            world_points_conf = predictions["world_points_conf"].squeeze(0).cpu().numpy()  # (S, H, W)
-            depth_maps = predictions["depth"].squeeze(0).cpu().numpy()     # (S, H, W, 1)
-            depth_confs = predictions["depth_conf"].squeeze(0).cpu().numpy() # (S, H, W)
-            
-            # Handle alignment based on window
-            if window_idx == 0:
-                transformed_extrinsics = extrinsic_window
-            if window_idx > 0:
-                assert previous_window_extrinsics is not None
 
-                overlap_start_global = max(0, start_idx)
-                overlap_end_global = min(start_idx + overlap, previous_window_end_idx)
-                actual_overlap = overlap_end_global - overlap_start_global
-                prev_overlap_frames = []
-                for global_idx in range(overlap_start_global, overlap_end_global):
-                    if global_idx in unified_results['extrinsics']:
-                        prev_overlap_frames.append(unified_results['extrinsics'][global_idx])
+        # Load and preprocess images for current window
+        if window_idx == 0:
+            print(window_image_paths[4])
+        else:
+            print(window_image_paths[0])
+        images = load_and_preprocess_images(window_image_paths).to(device)
+        print(f"Loaded window images shape: {images.shape}")
+        
+        # Run VGGT inference
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(dtype=dtype):
+                predictions = model(images)
+        
+        # Convert pose encoding to matrices
+        extrinsic_window, intrinsic_window = pose_encoding_to_extri_intri(
+            predictions["pose_enc"], images.shape[-2:]
+        )
+        
+        # Convert to numpy and remove batch dimension
+        extrinsic_window = extrinsic_window.squeeze(0).cpu().numpy()  # (S, 3, 4)
+        intrinsic_window = intrinsic_window.squeeze(0).cpu().numpy()   # (S, 3, 3)
+        images_np = images.cpu().numpy()  # (S, 3, H, W)
+        world_points_window = predictions["world_points"].squeeze(0).cpu().numpy()  # (S, H, W, 3)
+        world_points_conf = predictions["world_points_conf"].squeeze(0).cpu().numpy()  # (S, H, W)
+        depth_maps = predictions["depth"].squeeze(0).cpu().numpy()     # (S, H, W, 1)
+        depth_confs = predictions["depth_conf"].squeeze(0).cpu().numpy() # (S, H, W)
+        
+        # Handle alignment based on window
+        if window_idx == 0:
+            transformed_extrinsics = extrinsic_window
+            transformed_points = world_points_window
+            T_align = np.eye(4)
+        if window_idx > 0:
+            common_frame_idx = start_idx
+            # Verify this frame was processed in previous window
+            if common_frame_idx not in unified_results['extrinsics']:
+                raise ValueError(f"Common frame {common_frame_idx} missing in previous window")
+            
+            # transformed_extrinsics, T_align = transform_poses_to_reference(
+            #     extrinsic_window, unified_results['extrinsics'][common_frame_idx].copy()
+            # )
+            # # Transform points using the same alignment matrix
+            # transformed_points = transform_points_to_reference(
+            #     world_points_window, T_align
+            # )
+            transformed_extrinsics = extrinsic_window
+            transformed_points = world_points_window
+        for i in range(len(transformed_extrinsics)):
+                global_frame_idx = start_idx + i + window_idx 
+            # if global_frame_idx not in unified_results['extrinsics']:
+                unified_results['extrinsics'][global_frame_idx] = transformed_extrinsics[i]
+                unified_results['intrinsics'][global_frame_idx] = intrinsic_window[i]
+                unified_results['images'][global_frame_idx] = images_np[i]
+                unified_results['world_points'][global_frame_idx] = transformed_points[i]
+                unified_results['world_points_conf'][global_frame_idx] = world_points_conf[i]
+                unified_results['depth'][global_frame_idx] = depth_maps[i]
+                unified_results['depth_conf'][global_frame_idx] = depth_confs[i]
+            # else:
+            #     print(f"Frame {global_frame_idx} already processed, keeping original result")
                 
-                if len(prev_overlap_frames) > 0:
-                    prev_overlap_extrinsics = np.stack(prev_overlap_frames)
-                    
-                    # Get current window's overlapping frames (in local coordinates)
-                    curr_overlap_end = len(prev_overlap_frames)
-                    curr_overlap_extrinsics = previous_window_extrinsics[overlap_start_global:]
-                    
-                    transformed_nonoverlap_extrinsics = transform_poses_to_reference(
-                        extrinsic_window[curr_overlap_end:], previous_window_extrinsics[overlap_start_global]
-                    )
+        # Clear GPU memory
+        del predictions, images
+        torch.cuda.empty_cache()
+        
 
-                    transformed_extrinsics = np.concatenate([curr_overlap_extrinsics, transformed_nonoverlap_extrinsics], axis=0)
-
-            
-            for i in range(len(transformed_extrinsics)):
-                global_frame_idx = start_idx + i
-                
-                # For overlapping frames, keep the result from the first window that processed them
-                if global_frame_idx not in unified_results['extrinsics']:
-                    unified_results['extrinsics'][global_frame_idx] = transformed_extrinsics[i]
-                    unified_results['intrinsics'][global_frame_idx] = intrinsic_window[i]
-                    unified_results['images'][global_frame_idx] = images_np[i]
-                    unified_results['world_points'][global_frame_idx] = world_points[i]
-                    unified_results['world_points_conf'][global_frame_idx] = world_points_conf[i]
-                    unified_results['depth'][global_frame_idx] = depth_maps[i]
-                    unified_results['depth_conf'][global_frame_idx] = depth_confs[i]
-                else:
-                    # For overlapping frames, we keep the previous result
-                    print(f"Frame {global_frame_idx} already processed, keeping original result")
-            
-            # Update previous window data for next iteration
-            previous_window_extrinsics = transformed_extrinsics.copy()
-            previous_window_end_idx = end_idx
-            
-            # Clear GPU memory
-            del predictions, images
-            torch.cuda.empty_cache()
-            
-        except Exception as e:
-            print(f"Error processing window {window_idx}: {e}")
-            continue
-    
     # Convert dictionaries to arrays (sorted by frame index)
     frame_indices = sorted(unified_results['extrinsics'].keys())
     
