@@ -30,19 +30,19 @@ parser = argparse.ArgumentParser(description="VGGT demo with viser for large dat
 parser.add_argument(
     "--image_folder", type=str, default="../data/new_office/frames", help="Path to folder containing all images"
 )
-parser.add_argument("--use_point_map", action="store_true", help="Use point map instead of depth-based points")
+parser.add_argument("--use_point_map", default=False, action="store_true", help="Use point map instead of depth-based points")
 parser.add_argument("--background_mode", action="store_true", help="Run the viser server in background mode")
 parser.add_argument("--port", type=int, default=8080, help="Port number for the viser server")
 parser.add_argument(
     "--conf_threshold", type=float, default=25.0, help="Initial percentage of low-confidence points to filter out"
 )
 parser.add_argument("--mask_sky", action="store_true", help="Apply sky segmentation to filter out sky points")
-parser.add_argument("--window_size", type=int, default=5, help="Number of frames per processing window")
-parser.add_argument("--overlap", type=int, default=1, help="Number of overlapping frames between windows")
+parser.add_argument("--window_size", type=int, default=8, help="Number of frames per processing window")
+parser.add_argument("--overlap", type=int, default=7, help="Number of overlapping frames between windows")
 parser.add_argument("--save_results", type=str, default=None, help="Path to save unified results (.npz)")
 
 
-def to_4x4(extrinsic_3x4):
+def to_4x4(extrinsic_3x4):  
     """Convert 3x4 extrinsic matrix to 4x4 homogeneous matrix."""
     extrinsic_4x4 = np.eye(4)
     extrinsic_4x4[:3, :] = extrinsic_3x4
@@ -81,7 +81,7 @@ def transform_points_to_reference(points_window, T_align):
         points_hom[:, :3] = frame_points.reshape(-1, 3)
         
         # Apply transformation
-        transformed_hom = (T_align @ points_hom.T).T
+        transformed_hom = points_hom @ T_align
         
         # Convert back to 3D and reshape
         transformed_points[i] = transformed_hom[:, :3].reshape(H, W, 3)
@@ -101,9 +101,9 @@ def transform_poses_to_reference(extrinsics_window, reference_extrinsic):
         np.ndarray: Transformed extrinsics relative to reference
     """
     ref_4x4 = to_4x4(reference_extrinsic)
-    T_curr_common = to_4x4(extrinsics_window[0])
-    T_align = ref_4x4 @ closed_form_inverse_se3(T_curr_common[None])[0]
-
+    # T_curr_common = to_4x4(extrinsics_window[0])
+    # T_align = ref_4x4 @ closed_form_inverse_se3(T_curr_common[None])[0]
+    T_align = ref_4x4
     
     transformed_extrinsics = []
     for i in range(extrinsics_window.shape[0]):
@@ -164,7 +164,6 @@ def process_large_dataset_windowed(image_paths, window_size=70, overlap=20, devi
         'depth_conf': {}
     }
 
-    previous_window_extrinsics = None
     
     # Process each window
     for window_idx, start_idx in enumerate(tqdm(window_starts, desc="Processing windows")):
@@ -175,10 +174,6 @@ def process_large_dataset_windowed(image_paths, window_size=70, overlap=20, devi
         
 
         # Load and preprocess images for current window
-        if window_idx == 0:
-            print(window_image_paths[4])
-        else:
-            print(window_image_paths[0])
         images = load_and_preprocess_images(window_image_paths).to(device)
         print(f"Loaded window images shape: {images.shape}")
         
@@ -212,18 +207,19 @@ def process_large_dataset_windowed(image_paths, window_size=70, overlap=20, devi
             if common_frame_idx not in unified_results['extrinsics']:
                 raise ValueError(f"Common frame {common_frame_idx} missing in previous window")
             
-            # transformed_extrinsics, T_align = transform_poses_to_reference(
-            #     extrinsic_window, unified_results['extrinsics'][common_frame_idx].copy()
-            # )
-            # # Transform points using the same alignment matrix
-            # transformed_points = transform_points_to_reference(
-            #     world_points_window, T_align
-            # )
-            transformed_extrinsics = extrinsic_window
-            transformed_points = world_points_window
+            transformed_extrinsics, T_align = transform_poses_to_reference(
+                extrinsic_window, unified_results['extrinsics'][common_frame_idx].copy()
+            )
+            # Transform points using the same alignment matrix
+            transformed_points = transform_points_to_reference(
+                world_points_window, T_align
+            )
+            # transformed_extrinsics = extrinsic_window
+            # transformed_points = world_points_window
         for i in range(len(transformed_extrinsics)):
-                global_frame_idx = start_idx + i + window_idx 
-            # if global_frame_idx not in unified_results['extrinsics']:
+            global_frame_idx = start_idx + i
+            # global_frame_idx = start_idx + i + (window_idx * overlap)
+            if global_frame_idx not in unified_results['extrinsics']:
                 unified_results['extrinsics'][global_frame_idx] = transformed_extrinsics[i]
                 unified_results['intrinsics'][global_frame_idx] = intrinsic_window[i]
                 unified_results['images'][global_frame_idx] = images_np[i]
@@ -231,8 +227,8 @@ def process_large_dataset_windowed(image_paths, window_size=70, overlap=20, devi
                 unified_results['world_points_conf'][global_frame_idx] = world_points_conf[i]
                 unified_results['depth'][global_frame_idx] = depth_maps[i]
                 unified_results['depth_conf'][global_frame_idx] = depth_confs[i]
-            # else:
-            #     print(f"Frame {global_frame_idx} already processed, keeping original result")
+            else:
+                print(f"Frame {global_frame_idx} already processed, keeping original result")
                 
         # Clear GPU memory
         del predictions, images
