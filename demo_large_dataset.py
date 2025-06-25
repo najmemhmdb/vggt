@@ -10,6 +10,7 @@ from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.geometry import closed_form_inverse_se3
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from visual_util import predictions_to_glb
+from demo_viser import viser_wrapper
 
 # Argument parser
 parser = argparse.ArgumentParser(description="VGGT demo with viser for large datasets using overlap-based alignment")
@@ -23,9 +24,9 @@ parser.add_argument(
     "--conf_threshold", type=float, default=25.0, help="Initial percentage of low-confidence points to filter out"
 )
 parser.add_argument("--mask_sky", action="store_true", help="Apply sky segmentation to filter out sky points")
-parser.add_argument("--window_size", type=int, default=20, help="Number of frames per processing window")
-parser.add_argument("--overlap", type=int, default=15, help="Number of overlapping frames between windows")
-parser.add_argument("--save_results", type=str, default="glbscene_70_20_15_Tmean_average.glb", help="Path to save unified results (.npz)")
+parser.add_argument("--window_size", type=int, default=50, help="Number of frames per processing window")
+parser.add_argument("--overlap", type=int, default=30, help="Number of overlapping frames between windows")
+parser.add_argument("--save_results", type=str, default="glbscene_70_50_30_middleT_overlapnoupdate_intr.glb", help="Path to save unified results (.npz)")
 
 
 def to_4x4(extrinsic_3x4):  
@@ -86,8 +87,15 @@ def transform_poses_to_reference(extrinsics_window, transformation_matrix):
     Returns:
         np.ndarray: Transformed extrinsics relative to reference
     """
-    T_align = closed_form_inverse_se3(transformation_matrix[None])[0]
+    # T_align = closed_form_inverse_se3(transformation_matrix[None])[0]
     transformed_extrinsics = []
+    # for i in range(extrinsics_window.shape[0]):
+    #     current_4x4 = to_4x4(extrinsics_window[i])
+    #     transformed_4x4 = current_4x4 @ T_align
+    #     transformed_extrinsics.append(to_3x4(transformed_4x4))
+    middle_idx = len(transformation_matrix) // 2 + 1
+    T_align = closed_form_inverse_se3(transformation_matrix[middle_idx][None])[0]
+
     for i in range(extrinsics_window.shape[0]):
         current_4x4 = to_4x4(extrinsics_window[i])
         transformed_4x4 = current_4x4 @ T_align
@@ -107,10 +115,11 @@ def calculate_transformation(prev_overlaps, curr_overlaps):
     """
     all_rotations = []
     all_translations = []
-
+    all_T = []
     for E_prev, E_curr in zip(prev_overlaps, curr_overlaps):
         T = closed_form_inverse_se3(to_4x4(E_prev)[None])[0] @ to_4x4(E_curr)
         r = R.from_matrix(T[:3, :3])
+        all_T.append(T)
         all_rotations.append(r.as_euler('zyx', degrees=True))
         all_translations.append(T[:3, 3])
     r_total = R.from_euler('zyx', all_rotations, degrees=True)
@@ -121,7 +130,7 @@ def calculate_transformation(prev_overlaps, curr_overlaps):
     T_mean[:3, :3] = rotation_mean
     T_mean[:3, 3] = translation_mean
 
-    return T_mean
+    return T_mean, all_T
 
 def extrinsic_averaging(prev_ext, curr_ext):
     """
@@ -199,7 +208,7 @@ def process_large_dataset_windowed(image_paths, window_size=70, overlap=20, devi
         'depth': {},
         'depth_conf': {}
     }
-    
+    first_intrinsic = None
     # Process each window
     for window_idx, start_idx in enumerate(tqdm(window_starts, desc="Processing windows")):
         end_idx = min(start_idx + window_size, total_frames)
@@ -225,6 +234,7 @@ def process_large_dataset_windowed(image_paths, window_size=70, overlap=20, devi
         # Convert to numpy and remove batch dimension
         extrinsic_window = extrinsic_window.squeeze(0).cpu().numpy()  # (S, 3, 4)
         intrinsic_window = intrinsic_window.squeeze(0).cpu().numpy()   # (S, 3, 3)
+        print(np.mean(intrinsic_window, axis=0))
         images_np = images.cpu().numpy()  # (S, 3, H, W)
         world_points_window = predictions["world_points"].squeeze(0).cpu().numpy()  # (S, H, W, 3)
         world_points_conf = predictions["world_points_conf"].squeeze(0).cpu().numpy()  # (S, H, W)
@@ -234,30 +244,30 @@ def process_large_dataset_windowed(image_paths, window_size=70, overlap=20, devi
         # Handle alignment based on window
         if window_idx == 0:
             transformed_extrinsics = extrinsic_window
-            # transformed_points = world_points_window
+            transformed_points = world_points_window
+            first_intrinsic = intrinsic_window
             # T_align = np.eye(4)
         if window_idx > 0:
             common_frame_idx = start_idx
-
+            intrinsic_window = first_intrinsic
             if common_frame_idx not in unified_results['extrinsics']:
                 raise ValueError(f"Common frame {common_frame_idx} missing in previous window")
-            
             prev_overlaps = []
             for k, v in unified_results['extrinsics'].items():
                 if k >= common_frame_idx:
                     prev_overlaps.append(v)
 
-            T_averaged = calculate_transformation(prev_overlaps, extrinsic_window[:overlap].copy())
+            T_averaged, T_all = calculate_transformation(prev_overlaps, extrinsic_window[:overlap].copy())
             
             transformed_extrinsics = transform_poses_to_reference(
-                extrinsic_window, T_averaged
+                extrinsic_window, T_all
             )
             # Transform points using the same alignment matrix
             # transformed_points = transform_points_to_reference(
             #     world_points_window, T_averaged
             # )
             # transformed_extrinsics = extrinsic_window
-            # transformed_points = world_points_window
+            transformed_points = world_points_window
         for i in range(len(transformed_extrinsics)):
             global_frame_idx = start_idx + i
             # global_frame_idx = start_idx + i + (window_idx * overlap)
@@ -269,9 +279,9 @@ def process_large_dataset_windowed(image_paths, window_size=70, overlap=20, devi
                 # unified_results['world_points_conf'][global_frame_idx] = world_points_conf[i]
                 unified_results['depth'][global_frame_idx] = depth_maps[i]
                 unified_results['depth_conf'][global_frame_idx] = depth_confs[i]
-            else:
-                unified_results['extrinsics'][global_frame_idx] = extrinsic_averaging(unified_results['extrinsics'][global_frame_idx], 
-                                                                                      transformed_extrinsics[i])
+            # else:
+                # unified_results['extrinsics'][global_frame_idx] = extrinsic_averaging(unified_results['extrinsics'][global_frame_idx], 
+                #                                                                       transformed_extrinsics[i])
                 
         # Clear GPU memory
         del predictions, images
@@ -354,7 +364,7 @@ def main():
     if args.mask_sky:
         print("Sky segmentation enabled - will filter out sky points")
 
-    # print("Starting viser visualization...")
+    print("Starting viser visualization...")
     # viser_server = viser_wrapper(
     #     predictions,
     #     port=args.port,
@@ -375,7 +385,8 @@ def main():
         show_cam=True,
         mask_sky=False,
         target_dir=None,
-        prediction_mode="Predicted Pointmap")
+        prediction_mode="Predicted Pointmap", 
+        use_point_map=args.use_point_map)
     glbscene.export(file_obj=glbfile)
     print("Visualization complete")
 

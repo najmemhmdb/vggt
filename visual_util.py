@@ -25,6 +25,7 @@ def predictions_to_glb(
     mask_sky=False,
     target_dir=None,
     prediction_mode="Predicted Pointmap",
+    use_point_map=False
 ) -> trimesh.Scene:
     """
     Converts VGGT predictions to a 3D scene represented as a GLB file.
@@ -65,25 +66,17 @@ def predictions_to_glb(
         except (ValueError, IndexError):
             pass
 
-    if "Pointmap" in prediction_mode:
+    if use_point_map:
         print("Using Pointmap Branch")
-        if "world_points" in predictions:
-            pred_world_points = predictions["world_points"]  # No batch dimension to remove
-            pred_world_points_conf = predictions.get("world_points_conf", np.ones_like(pred_world_points[..., 0]))
-        else:
-            print("Warning: world_points not found in predictions, falling back to depth-based points")
-            # pred_world_points = predictions["world_points_from_depth"]
-            # pred_world_points_conf = predictions.get("depth_conf", np.ones_like(pred_world_points[..., 0]))
-            depth_map = predictions["depth"]  # (S, H, W, 1)
-            depth_conf = predictions["depth_conf"]  # (S, H, W)
-            extrinsics_cam = predictions["extrinsic"]  # (S, 3, 4)
-            intrinsics_cam = predictions["intrinsic"]  # (S, 3, 3)
-            pred_world_points = unproject_depth_map_to_point_map(depth_map, extrinsics_cam, intrinsics_cam)
-            pred_world_points_conf = depth_conf
+        pred_world_points = predictions["world_points"]  # No batch dimension to remove
+        pred_world_points_conf = predictions.get("world_points_conf", np.ones_like(pred_world_points[..., 0]))
     else:
-        print("Using Depthmap and Camera Branch")
-        pred_world_points = predictions["world_points_from_depth"]
-        pred_world_points_conf = predictions.get("depth_conf", np.ones_like(pred_world_points[..., 0]))
+        depth_map = predictions["depth"]  # (S, H, W, 1)
+        depth_conf = predictions["depth_conf"]  # (S, H, W)
+        extrinsics_cam = predictions["extrinsic"]  # (S, 3, 4)
+        intrinsics_cam = predictions["intrinsic"]  # (S, 3, 3)
+        pred_world_points = unproject_depth_map_to_point_map(depth_map, extrinsics_cam, intrinsics_cam)
+        pred_world_points_conf = depth_conf
 
     # Get images from predictions
     images = predictions["images"]
