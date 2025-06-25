@@ -24,8 +24,8 @@ parser.add_argument(
 )
 parser.add_argument("--mask_sky", action="store_true", help="Apply sky segmentation to filter out sky points")
 parser.add_argument("--window_size", type=int, default=20, help="Number of frames per processing window")
-parser.add_argument("--overlap", type=int, default=10, help="Number of overlapping frames between windows")
-parser.add_argument("--save_results", type=str, default="glbscene_70_20_10_Tmean.glb", help="Path to save unified results (.npz)")
+parser.add_argument("--overlap", type=int, default=15, help="Number of overlapping frames between windows")
+parser.add_argument("--save_results", type=str, default="glbscene_70_20_15_Tmean_average.glb", help="Path to save unified results (.npz)")
 
 
 def to_4x4(extrinsic_3x4):  
@@ -67,7 +67,7 @@ def transform_points_to_reference(points_window, T_align):
         points_hom[:, :3] = frame_points.reshape(-1, 3)
         
         # Apply transformation
-        transformed_hom = points_hom @ T_align
+        transformed_hom = (T_align @ points_hom.T).T 
         
         # Convert back to 3D and reshape
         transformed_points[i] = transformed_hom[:, :3].reshape(H, W, 3)
@@ -93,7 +93,7 @@ def transform_poses_to_reference(extrinsics_window, transformation_matrix):
         transformed_4x4 = current_4x4 @ T_align
         transformed_extrinsics.append(to_3x4(transformed_4x4))
 
-    return np.stack(transformed_extrinsics), T_align
+    return np.stack(transformed_extrinsics)
 
 
 def calculate_transformation(prev_overlaps, curr_overlaps):
@@ -113,7 +113,6 @@ def calculate_transformation(prev_overlaps, curr_overlaps):
         r = R.from_matrix(T[:3, :3])
         all_rotations.append(r.as_euler('zyx', degrees=True))
         all_translations.append(T[:3, 3])
-    print(all_translations)
     r_total = R.from_euler('zyx', all_rotations, degrees=True)
     rotation_mean = r_total.mean().as_matrix()
     translation_mean = np.mean(all_translations, axis=0)
@@ -128,8 +127,8 @@ def extrinsic_averaging(prev_ext, curr_ext):
     """
     Calculate average of previous window prediction for a frame and the current one
     Args:
-        prev_ext (np.ndarray): Previous Extrinsic prediction (3, 4)
-        curr_ext (np.ndarray): Current Extrinsic prediction (3, 4)
+        prev_ext (np.ndarray): Previous Extrinsic Prediction (3, 4)
+        curr_ext (np.ndarray): Current Extrinsic Prediction (3, 4)
     Returns:
         np.ndarray: Average exitrinsc of shape (3, 4)
     """
@@ -184,8 +183,8 @@ def process_large_dataset_windowed(image_paths, window_size=70, overlap=20, devi
     window_starts = list(range(0, total_frames - window_size + 1, stride))
     
     # Ensure last window doesn't exceed bounds
-    if window_starts[-1] + window_size > total_frames:
-        window_starts[-1] = total_frames - window_size
+    if window_starts[-1] + window_size < total_frames:
+        window_starts.append(window_starts[-1]+stride)
         
     print('window_starts', window_starts)
     print(f"Will process {len(window_starts)} windows")
@@ -235,44 +234,44 @@ def process_large_dataset_windowed(image_paths, window_size=70, overlap=20, devi
         # Handle alignment based on window
         if window_idx == 0:
             transformed_extrinsics = extrinsic_window
-            transformed_points = world_points_window
-            T_align = np.eye(4)
+            # transformed_points = world_points_window
+            # T_align = np.eye(4)
         if window_idx > 0:
             common_frame_idx = start_idx
-            # Verify this frame was processed in previous window
+
             if common_frame_idx not in unified_results['extrinsics']:
                 raise ValueError(f"Common frame {common_frame_idx} missing in previous window")
+            
             prev_overlaps = []
             for k, v in unified_results['extrinsics'].items():
                 if k >= common_frame_idx:
-                    print(k)
                     prev_overlaps.append(v)
 
             T_averaged = calculate_transformation(prev_overlaps, extrinsic_window[:overlap].copy())
             
-            transformed_extrinsics, T_align = transform_poses_to_reference(
+            transformed_extrinsics = transform_poses_to_reference(
                 extrinsic_window, T_averaged
             )
             # Transform points using the same alignment matrix
-            transformed_points = transform_points_to_reference(
-                world_points_window, T_align
-            )
+            # transformed_points = transform_points_to_reference(
+            #     world_points_window, T_averaged
+            # )
             # transformed_extrinsics = extrinsic_window
             # transformed_points = world_points_window
         for i in range(len(transformed_extrinsics)):
             global_frame_idx = start_idx + i
             # global_frame_idx = start_idx + i + (window_idx * overlap)
-            # if global_frame_idx not in unified_results['extrinsics']:
-            unified_results['extrinsics'][global_frame_idx] = transformed_extrinsics[i]
-            unified_results['intrinsics'][global_frame_idx] = intrinsic_window[i]
-            unified_results['images'][global_frame_idx] = images_np[i]
-            unified_results['world_points'][global_frame_idx] = transformed_points[i]
-            unified_results['world_points_conf'][global_frame_idx] = world_points_conf[i]
-            unified_results['depth'][global_frame_idx] = depth_maps[i]
-            unified_results['depth_conf'][global_frame_idx] = depth_confs[i]
-            # else:
-            #     unified_results['extrinsics'][global_frame_idx] = extrinsic_averaging(unified_results['extrinsics'][global_frame_idx], 
-                                                                                    #   transformed_extrinsics[i])
+            if global_frame_idx not in unified_results['extrinsics']:
+                unified_results['extrinsics'][global_frame_idx] = transformed_extrinsics[i]
+                unified_results['intrinsics'][global_frame_idx] = intrinsic_window[i]
+                unified_results['images'][global_frame_idx] = images_np[i]
+                # unified_results['world_points'][global_frame_idx] = transformed_points[i]
+                # unified_results['world_points_conf'][global_frame_idx] = world_points_conf[i]
+                unified_results['depth'][global_frame_idx] = depth_maps[i]
+                unified_results['depth_conf'][global_frame_idx] = depth_confs[i]
+            else:
+                unified_results['extrinsics'][global_frame_idx] = extrinsic_averaging(unified_results['extrinsics'][global_frame_idx], 
+                                                                                      transformed_extrinsics[i])
                 
         # Clear GPU memory
         del predictions, images
@@ -286,8 +285,8 @@ def process_large_dataset_windowed(image_paths, window_size=70, overlap=20, devi
         'images': np.stack([unified_results['images'][i] for i in frame_indices]),
         'extrinsic': np.stack([unified_results['extrinsics'][i] for i in frame_indices]),
         'intrinsic': np.stack([unified_results['intrinsics'][i] for i in frame_indices]),
-        'world_points': np.stack([unified_results['world_points'][i] for i in frame_indices]),
-        'world_points_conf': np.stack([unified_results['world_points_conf'][i] for i in frame_indices]),
+        # 'world_points': np.stack([unified_results['world_points'][i] for i in frame_indices]),
+        # 'world_points_conf': np.stack([unified_results['world_points_conf'][i] for i in frame_indices]),
         'depth': np.stack([unified_results['depth'][i] for i in frame_indices]),
         'depth_conf': np.stack([unified_results['depth_conf'][i] for i in frame_indices])
     }
@@ -297,7 +296,7 @@ def process_large_dataset_windowed(image_paths, window_size=70, overlap=20, devi
     print(f"- Images: {final_results['images'].shape}")
     print(f"- Extrinsics: {final_results['extrinsic'].shape}")
     print(f"- Intrinsics: {final_results['intrinsic'].shape}")
-    print(f"- World points: {final_results['world_points'].shape}")
+    # print(f"- World points: {final_results['world_points'].shape}")
     print(f"- Depth: {final_results['depth'].shape}")
     
     return final_results
@@ -343,9 +342,9 @@ def main():
     )
 
     # Save results if requested
-    if args.save_results:
-        print(f"Saving unified results to {args.save_results}")
-        np.savez_compressed(args.save_results, **predictions)
+    # if args.save_results:
+    #     print(f"Saving unified results to {args.save_results}")
+        # np.savez_compressed(args.save_results, **predictions)
 
     if args.use_point_map:
         print("Visualizing 3D points from point map")
