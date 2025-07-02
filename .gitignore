@@ -148,3 +148,5 @@ skyseg.onnx
 .pixi
 *.egg-info
 *.glb
+*.jpg
+*.zip

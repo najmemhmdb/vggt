@@ -11,22 +11,23 @@ from vggt.utils.geometry import closed_form_inverse_se3
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from visual_util import predictions_to_glb
 from demo_viser import viser_wrapper
+from my_alignment_utils import umeyama_sim3
 
 # Argument parser
 parser = argparse.ArgumentParser(description="VGGT demo with viser for large datasets using overlap-based alignment")
 parser.add_argument(
     "--image_folder", type=str, default="../data/new_office/frames", help="Path to folder containing all images"
 )
-parser.add_argument("--use_point_map", default=True, action="store_true", help="Use point map instead of depth-based points")
+parser.add_argument("--use_point_map", default=False, action="store_true", help="Use point map instead of depth-based points")
 parser.add_argument("--background_mode", action="store_true", help="Run the viser server in background mode")
 parser.add_argument("--port", type=int, default=8080, help="Port number for the viser server")
 parser.add_argument(
     "--conf_threshold", type=float, default=25.0, help="Initial percentage of low-confidence points to filter out"
 )
 parser.add_argument("--mask_sky", action="store_true", help="Apply sky segmentation to filter out sky points")
-parser.add_argument("--window_size", type=int, default=50, help="Number of frames per processing window")
-parser.add_argument("--overlap", type=int, default=30, help="Number of overlapping frames between windows")
-parser.add_argument("--save_results", type=str, default="glbscene2_70_50_30_noT.glb", help="Path to save unified results (.npz)")
+parser.add_argument("--window_size", type=int, default=20, help="Number of frames per processing window")
+parser.add_argument("--overlap", type=int, default=15, help="Number of overlapping frames between windows")
+parser.add_argument("--save_results", type=str, default="glbscene_50_20_15_sim3.glb", help="Path to save unified results (.npz)")
 
 
 def to_4x4(extrinsic_3x4):  
@@ -41,96 +42,55 @@ def to_3x4(extrinsic_4x4):
     return extrinsic_4x4[:3, :]
 
 
-# def extrinsic_to_pose(extrinsic):
-#     """Convert camera extrinsic to camera pose (position in world) using proper SE3 inverse"""
-#     return closed_form_inverse_se3(to_4x4(extrinsic)[None])[0]
+def get_camera_centers(extrinsics_4x4):
+    R = extrinsics_4x4[:, :3, :3]
+    t = extrinsics_4x4[:, :3, 3:]
+    C = -np.matmul(np.transpose(R, (0, 2, 1)), t)  # -Rᵀ t
+    return C.squeeze(-1)
 
-
-# def transform_points_to_reference(points_window, T_align):
-#     """
-#     Transform 3D points to global reference system using T_align matrix
+def transform_poses_to_reference(extrinsics_window, transformation_matrix):
+    """
+    Transform poses in a window to be relative to the reference coordinate system.
     
-#     Args:
-#         points_window (np.ndarray): Points in window's local coordinates (S, H, W, 3)
-#         T_align (np.ndarray): 4x4 alignment matrix
-        
-#     Returns:
-#         np.ndarray: Transformed points in global coordinates (S, H, W, 3)
-#     """
-#     transformed_points = np.zeros_like(points_window)
+    Args:
+        extrinsics_window (np.ndarray): Window extrinsics of shape (S, 3, 4)
+        transformation_matrix (np.ndarray): Noise-free Transformation (4, 4)
     
-#     for i in range(points_window.shape[0]):
-#         frame_points = points_window[i]
-#         H, W, _ = frame_points.shape
-        
-#         # Convert to homogeneous coordinates
-#         points_hom = np.ones((H * W, 4))
-#         points_hom[:, :3] = frame_points.reshape(-1, 3)
-        
-#         # Apply transformation
-#         transformed_hom = (T_align @ points_hom.T).T 
-        
-#         # Convert back to 3D and reshape
-#         transformed_points[i] = transformed_hom[:, :3].reshape(H, W, 3)
-    
-#     return transformed_points
+    Returns:
+        np.ndarray: Transformed extrinsics relative to reference
+    """
+    T_align_inv = closed_form_inverse_se3(transformation_matrix[None])[0]
+    transformed_extrinsics = []
+
+    for i in range(extrinsics_window.shape[0]):
+        current_4x4 = to_4x4(extrinsics_window[i])
+        transformed_4x4 = current_4x4 @ T_align_inv
+        transformed_extrinsics.append(to_3x4(transformed_4x4))
+
+    return np.stack(transformed_extrinsics)
 
 
-# def transform_poses_to_reference(extrinsics_window, transformation_matrix):
-#     """
-#     Transform poses in a window to be relative to the reference coordinate system.
-    
-#     Args:
-#         extrinsics_window (np.ndarray): Window extrinsics of shape (S, 3, 4)
-#         transformation_matrix (np.ndarray): Averaged Transformation (4, 4)
-    
-#     Returns:
-#         np.ndarray: Transformed extrinsics relative to reference
-#     """
-#     # T_align = closed_form_inverse_se3(transformation_matrix[None])[0]
-#     transformed_extrinsics = []
-#     # for i in range(extrinsics_window.shape[0]):
-#     #     current_4x4 = to_4x4(extrinsics_window[i])
-#     #     transformed_4x4 = current_4x4 @ T_align
-#     #     transformed_extrinsics.append(to_3x4(transformed_4x4))
-#     middle_idx = len(transformation_matrix) // 2 + 1
-#     T_align = closed_form_inverse_se3(transformation_matrix[middle_idx][None])[0]
+def calculate_transformation(prev_overlaps, curr_overlaps):
+    """
+    Calculate noise-free transformation between two windows
+    Args:
+        prev_overlaps (np.ndarray): Previous overlaps of shape (S, 3, 4)
+        curr_overlaps (np.ndarray): Current overlaps of shape (S, 3, 4)
+    Returns:
+        np.ndarray: noise-free transformation of shape (3, 4)
+    """
+    # camera centres (world coords) are rows 3 of inv(E)
+    C_prev = get_camera_centers(np.stack(prev_overlaps))
+    C_curr = get_camera_centers(np.stack(curr_overlaps))
+    print(C_prev.shape, C_curr.shape)
+    S, R, t = umeyama_sim3(C_curr, C_prev)
+    T_align = np.eye(4)
+    T_align[:3, :3] = S*R
+    T_align[:3, 3] = t
 
-#     for i in range(extrinsics_window.shape[0]):
-#         current_4x4 = to_4x4(extrinsics_window[i])
-#         transformed_4x4 = current_4x4 @ T_align
-#         transformed_extrinsics.append(to_3x4(transformed_4x4))
+    # T_align = closed_form_inverse_se3(prev_overlaps[0][None])[0]
+    return T_align
 
-#     return np.stack(transformed_extrinsics)
-
-
-# def calculate_transformation(prev_overlaps, curr_overlaps):
-#     """
-#     Calculate all transformations and then calculate the average transformation
-#     Args:
-#         prev_overlaps (np.ndarray): Previous overlaps of shape (S, 3, 4)
-#         curr_overlaps (np.ndarray): Current overlaps of shape (S, 3, 4)
-#     Returns:
-#         np.ndarray: Average transformation of shape (3, 4)
-#     """
-#     all_rotations = []
-#     all_translations = []
-#     all_T = []
-#     for E_prev, E_curr in zip(prev_overlaps, curr_overlaps):
-#         T = closed_form_inverse_se3(to_4x4(E_prev)[None])[0] @ to_4x4(E_curr)
-#         r = R.from_matrix(T[:3, :3])
-#         all_T.append(T)
-#         all_rotations.append(r.as_euler('zyx', degrees=True))
-#         all_translations.append(T[:3, 3])
-#     r_total = R.from_euler('zyx', all_rotations, degrees=True)
-#     rotation_mean = r_total.mean().as_matrix()
-#     translation_mean = np.mean(all_translations, axis=0)
-
-#     T_mean = np.eye(4)
-#     T_mean[:3, :3] = rotation_mean
-#     T_mean[:3, 3] = translation_mean
-
-#     return T_mean, all_T
 
 # def extrinsic_averaging(prev_ext, curr_ext):
 #     """
@@ -158,6 +118,33 @@ def to_3x4(extrinsic_4x4):
 #     ext_mean[:3, 3] = translation_mean
 
 #     return to_3x4(ext_mean)
+
+
+# def relative_transform(T1, T2):
+#     """Compute relative transformation T = E2 @ inv(E1)"""
+#     return T2 @ np.linalg.inv(T1)
+
+
+# def compare_relative_transforms(E5_w0, E6_w0, E5_w1, E6_w1):
+#     """Compare relative transforms between (E5→E6) in both windows"""
+#     T_5to6_w0 = relative_transform(E5_w0, E6_w0)
+#     T_5to6_w1 = relative_transform(E5_w1, E6_w1)
+
+#     # Compare translation
+#     t0 = T_5to6_w0[:3, 3]
+#     t1 = T_5to6_w1[:3, 3]
+#     t_error = np.linalg.norm(t0 - t1)
+
+#     # Compare rotation
+#     R0 = T_5to6_w0[:3, :3]
+#     R1 = T_5to6_w1[:3, :3]
+#     R_diff = R.from_matrix(R0 @ R1.T)
+#     r_error = R_diff.magnitude() * (180.0 / np.pi)
+
+#     print(f"Translation error: {t_error:.6f} m")
+#     print(f"Rotation error:    {r_error:.4f} degrees")
+#     return t_error, r_error
+
 
 def process_large_dataset_windowed(image_paths, window_size=70, overlap=20, device="cuda"):
     """
@@ -208,7 +195,6 @@ def process_large_dataset_windowed(image_paths, window_size=70, overlap=20, devi
         'depth': {},
         'depth_conf': {}
     }
-    # first_intrinsic = None
     # Process each window
     for window_idx, start_idx in enumerate(tqdm(window_starts, desc="Processing windows")):
         end_idx = min(start_idx + window_size, total_frames)
@@ -234,42 +220,47 @@ def process_large_dataset_windowed(image_paths, window_size=70, overlap=20, devi
         # Convert to numpy and remove batch dimension
         extrinsic_window = extrinsic_window.squeeze(0).cpu().numpy()  # (S, 3, 4)
         intrinsic_window = intrinsic_window.squeeze(0).cpu().numpy()   # (S, 3, 3)
-        print(np.mean(intrinsic_window, axis=0))
         images_np = images.cpu().numpy()  # (S, 3, H, W)
         world_points_window = predictions["world_points"].squeeze(0).cpu().numpy()  # (S, H, W, 3)
         world_points_conf = predictions["world_points_conf"].squeeze(0).cpu().numpy()  # (S, H, W)
         depth_maps = predictions["depth"].squeeze(0).cpu().numpy()     # (S, H, W, 1)
         depth_confs = predictions["depth_conf"].squeeze(0).cpu().numpy() # (S, H, W)
-        
+        transformed_extrinsics = extrinsic_window
         # Handle alignment based on window
         if window_idx == 0:
             transformed_extrinsics = extrinsic_window
+       
         if window_idx > 0:
             common_frame_idx = start_idx
             if common_frame_idx not in unified_results['extrinsics']:
                 raise ValueError(f"Common frame {common_frame_idx} missing in previous window")
+
             prev_overlaps = []
             for k, v in unified_results['extrinsics'].items():
                 if k >= common_frame_idx:
-                    prev_overlaps.append(v)
+                    prev_overlaps.append(to_4x4(v.copy()))
+            curr_overlaps = []
+            for i in range(overlap):
+                curr_overlaps.append(to_4x4(extrinsic_window[i].copy()))
+            # for o_i in range(overlap-1):
+            #     compare_relative_transforms(prev_overlaps[o_i], prev_overlaps[o_i+1], curr_overlaps[o_i], curr_overlaps[o_i+1])
 
-            # T_averaged, T_all = calculate_transformation(prev_overlaps, extrinsic_window[:overlap].copy())
-            
-            # transformed_extrinsics = transform_poses_to_reference(
-            #     extrinsic_window, T_all
-            # )
-            transformed_extrinsics = extrinsic_window
+            T_align = calculate_transformation(prev_overlaps, curr_overlaps)
+            transformed_extrinsics = transform_poses_to_reference(
+                extrinsic_window, T_align
+            )
+   
         for i in range(len(transformed_extrinsics)):
             global_frame_idx = start_idx + i
             # global_frame_idx = start_idx + i + (window_idx * overlap)
-            if global_frame_idx not in unified_results['extrinsics']:
-                unified_results['extrinsics'][global_frame_idx] = transformed_extrinsics[i]
-                unified_results['intrinsics'][global_frame_idx] = intrinsic_window[i]
-                unified_results['images'][global_frame_idx] = images_np[i]
-                unified_results['world_points'][global_frame_idx] = world_points_window[i]
-                unified_results['world_points_conf'][global_frame_idx] = world_points_conf[i]
-                unified_results['depth'][global_frame_idx] = depth_maps[i]
-                unified_results['depth_conf'][global_frame_idx] = depth_confs[i]
+            # if global_frame_idx not in unified_results['extrinsics']:
+            unified_results['extrinsics'][global_frame_idx] = transformed_extrinsics[i]
+            unified_results['intrinsics'][global_frame_idx] = intrinsic_window[i]
+            unified_results['images'][global_frame_idx] = images_np[i]
+            unified_results['world_points'][global_frame_idx] = world_points_window[i]
+            unified_results['world_points_conf'][global_frame_idx] = world_points_conf[i]
+            unified_results['depth'][global_frame_idx] = depth_maps[i]
+            unified_results['depth_conf'][global_frame_idx] = depth_confs[i]
             # else:
                 # unified_results['extrinsics'][global_frame_idx] = extrinsic_averaging(unified_results['extrinsics'][global_frame_idx], 
                 #                                                                       transformed_extrinsics[i])
@@ -326,7 +317,7 @@ def main():
     new_image_paths = []
     for i in range(0, len(image_paths), 30):
         new_image_paths.append(image_paths[i])
-    image_paths = new_image_paths[:70]
+    image_paths = new_image_paths[0:50]
     print(f"Found {len(image_paths)} images")
 
 
@@ -341,11 +332,6 @@ def main():
         overlap=args.overlap,
         device=device
     )
-
-    # Save results if requested
-    # if args.save_results:
-    #     print(f"Saving unified results to {args.save_results}")
-        # np.savez_compressed(args.save_results, **predictions)
 
     if args.use_point_map:
         print("Visualizing 3D points from point map")

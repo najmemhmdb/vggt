@@ -71,6 +71,7 @@ def predictions_to_glb(
         pred_world_points = predictions["world_points"]  # No batch dimension to remove
         pred_world_points_conf = predictions.get("world_points_conf", np.ones_like(pred_world_points[..., 0]))
     else:
+        print("Using depth image to estimate points")
         depth_map = predictions["depth"]  # (S, H, W, 1)
         depth_conf = predictions["depth_conf"]  # (S, H, W)
         extrinsics_cam = predictions["extrinsic"]  # (S, 3, 4)
