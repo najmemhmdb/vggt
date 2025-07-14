@@ -11,6 +11,7 @@ import copy
 import torch
 import torch.nn.functional as F
 import shutil
+import math
 import cv2
 # Configure CUDA settings
 torch.backends.cudnn.enabled = True
@@ -20,8 +21,7 @@ import argparse
 from pathlib import Path
 import trimesh
 import pycolmap
-
-
+from scipy.spatial.transform import Rotation as R, Slerp
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images_square
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
@@ -190,6 +190,7 @@ def parse_args():
     parser.add_argument(
         "--fine_tracking", action="store_true", default=True, help="Use fine tracking (slower but more accurate)"
     )
+    parser.add_argument("--freq_factor", type=int, default=3, help="Frequency factor for each round sampling")
     return parser.parse_args()
 
 
@@ -223,8 +224,6 @@ def run_VGGT(model, images, dtype, resolution=518):
     print('shape of depth_map', depth_map.shape)
     print('shape of depth_conf', depth_conf.shape)
     return extrinsic, intrinsic, depth_map, depth_conf
-
-
 
 def rename_colmap_recons_and_rescale_camera(
     reconstruction, image_paths, original_coords, img_size, shift_point2d_to_original_res=False, shared_camera=False
@@ -297,6 +296,81 @@ def export_and_visualize_glb(scene_dir: str,
     # Launch trimesh’s built‐in viewer
 
 
+def interpolate_extrinsic(extrinsic, image_path_list_all, vggt_indices):
+    extrinsic_all = np.zeros((len(image_path_list_all), 3, 4), dtype=np.float32)
+    for i, idx in enumerate(vggt_indices):
+        extrinsic_all[idx] = extrinsic[i]
+
+    # Step 1: Extract rotations and translations
+    rotations = R.from_matrix([extrinsic_all[i][:3, :3] for i in vggt_indices])
+    translations = np.array([extrinsic_all[i][:3, 3] for i in vggt_indices])
+
+    # Step 2: Interpolation times
+    key_times = np.array(vggt_indices)
+    interp_times = np.arange(len(image_path_list_all))
+
+    # Step 3: Create interpolators
+    slerp = Slerp(key_times, rotations)
+    interp_rots = slerp(interp_times)
+
+    interp_trans = np.empty((len(image_path_list_all), 3))
+    for i in range(3):  # interpolate each translation axis
+        interp_trans[:, i] = np.interp(interp_times, key_times, translations[:, i])
+
+    # Step 4: Compose interpolated extrinsics
+    for i in range(len(image_path_list_all)):
+        if i in vggt_indices:
+            continue
+        extrinsic_all[i][:3, :3] = interp_rots[i].as_matrix()
+        extrinsic_all[i][:3, 3] = interp_trans[i]
+        
+    return extrinsic_all
+
+
+def run(image_path_list_all, img_load_resolution, vggt_fixed_resolution, model, device, dtype, freq_factor):
+
+    # initialize all the arrays
+    images_all = np.zeros((len(image_path_list_all), 3, img_load_resolution, img_load_resolution), dtype=np.float32)
+    original_coords_all = np.zeros((len(image_path_list_all), 6), dtype=np.float32)
+    intrinsic_all = np.zeros((len(image_path_list_all), 3, 3), dtype=np.float32)
+    depth_map_all = np.zeros((len(image_path_list_all), vggt_fixed_resolution, vggt_fixed_resolution, 1), dtype=np.float32)
+    depth_conf_all = np.zeros((len(image_path_list_all), vggt_fixed_resolution, vggt_fixed_resolution), dtype=np.float32)
+
+    for i in range(freq_factor):
+        # Get initial indices for this round
+        indices = list(range(i, len(image_path_list_all), freq_factor))
+        if i == 0:
+            if indices[-1] != len(image_path_list_all) - 1:
+                indices.append(len(image_path_list_all) - 1)
+            first_round_indices = indices
+
+        else:
+            # Avoid duplicate processing of the last item
+            if indices and indices[-1] == len(image_path_list_all) - 1 and indices[-1] in first_round_indices:
+                indices = indices[:-1]
+
+        # Get the actual image paths for this round
+        image_path_list = [image_path_list_all[idx] for idx in indices]
+        # Load and preprocess images
+        images, original_coords = load_and_preprocess_images_square(image_path_list, img_load_resolution)
+        images = images.to(device)
+
+        # Run VGGT
+        extrinsic, intrinsic, depth_map, depth_conf = run_VGGT(model, images, dtype, vggt_fixed_resolution)
+
+        # First round: interpolate extrinsic
+        if i == 0:
+            extrinsic_all = interpolate_extrinsic(extrinsic, image_path_list_all, first_round_indices)
+
+        # Save outputs to their proper indices
+        for j, idx in enumerate(indices):
+            images_all[idx] = images[j].cpu()
+            original_coords_all[idx] = original_coords[j]
+            intrinsic_all[idx] = intrinsic[j]
+            depth_map_all[idx] = depth_map[j]
+            depth_conf_all[idx] = depth_conf[j]
+
+    return depth_map_all, depth_conf_all, intrinsic_all, extrinsic_all, images_all, original_coords_all
 
 def demo_fn(args):
     # Print configuration
@@ -327,26 +401,32 @@ def demo_fn(args):
 
     # Get image paths and preprocess them
     image_dir = os.path.join(args.scene_dir, "images")
-    image_path_list = glob.glob(os.path.join(image_dir, "*"))
-    image_path_list = sorted(image_path_list)[:70]
-    print(image_path_list)
+    image_path_list_all = glob.glob(os.path.join(image_dir, "*"))
+    image_path_list_all = sorted(image_path_list_all)
+    image_path_list = image_path_list_all[::args.freq_factor]
+    if image_path_list[-1] != image_path_list_all[-1]:
+        image_path_list.append(image_path_list_all[-1])
+    print(f'number of images in the first round: {len(image_path_list)}, total images in the dataset: {len(image_path_list_all)}')
+
     if len(image_path_list) == 0:
         raise ValueError(f"No images found in {image_dir}")
-    base_image_path_list = [os.path.basename(path) for path in image_path_list]
+    base_image_path_list = [os.path.basename(path) for path in image_path_list_all]
 
     # Load images and original coordinates
     # Load Image in 1024, while running VGGT with 518
     vggt_fixed_resolution = 518
     img_load_resolution = 1024
 
-    images, original_coords = load_and_preprocess_images_square(image_path_list, img_load_resolution)
-    images = images.to(device)
-    original_coords = original_coords.to(device)
-    print(f"Loaded {len(images)} images from {image_dir}")
-    print('shape of processed images', images.shape)
-    # Run VGGT to estimate camera and depth
-    # Run with 518x518 images
-    extrinsic, intrinsic, depth_map, depth_conf = run_VGGT(model, images, dtype, vggt_fixed_resolution)
+    all_data = run(image_path_list_all, img_load_resolution, vggt_fixed_resolution, model, device, dtype, args.freq_factor)
+    depth_map, depth_conf, intrinsic, extrinsic, images, original_coords = all_data
+    images = torch.from_numpy(images).to(device)
+    original_coords = torch.from_numpy(original_coords).to(device)
+    print('shape of images', images.shape)
+    print('shape of original_coords', original_coords.shape)
+    print('shape of depth_map', depth_map.shape)
+    print('shape of depth_conf', depth_conf.shape)
+    print('shape of intrinsic', intrinsic.shape)
+    print('shape of extrinsic', extrinsic.shape)
     points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic)
     print('shape of points_3d', points_3d.shape)
     if args.use_ba:
@@ -488,3 +568,14 @@ if __name__ == "__main__":
     args = parse_args()
     with torch.no_grad():
         demo_fn(args)
+
+
+    # all_frames = os.listdir("/mnt/public/Ehsan/datasets/private/Najmeh/real_data/new_lab/all_frames")
+    # all_frames = sorted(all_frames)
+    # print(len(all_frames))
+    # idx = list(range(0, len(all_frames), 9))
+    # os.makedirs("/mnt/public/Ehsan/datasets/private/Najmeh/real_data/new_lab_v2/images", exist_ok=True)
+    # for i in idx:
+    #     shutil.copy(os.path.join("/mnt/public/Ehsan/datasets/private/Najmeh/real_data/new_lab/all_frames", all_frames[i]),
+    #                  os.path.join("/mnt/public/Ehsan/datasets/private/Najmeh/real_data/new_lab_v2/images", all_frames[i]))
+   
